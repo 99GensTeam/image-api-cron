@@ -1,0 +1,96 @@
+name: Node API build and push to ECR and Deploy on K8s
+
+on:
+  push:
+    branches:    
+      - main
+
+jobs:
+
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - run: echo ${{github.event.base_ref}}
+      - uses: actions/checkout@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.ECR_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.ECR_ACCESS_SECRET_ID }}
+          aws-region: us-east-2
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+        
+      - name: Build, tag, and push image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.ref_name }}
+        run: |
+          tag=$(git rev-parse --short HEAD)
+          sed -i "s/.env.dev/.env.prod/g" Dockerfile
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:prod-image-api-$tag .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:prod-image-api-$tag
+       
+      - name: Log out of Amazon ECR
+        if: always()
+        run: docker logout ${{ steps.login-ecr.outputs.registry }}
+  
+  helm:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+      - uses: GuillaumeFalourd/clone-github-repo-action@v2
+        with:
+          owner: '99GensTeam'
+          repository: 'Helm-Charts-EKS-Deployment'
+          access-token: ${{ secrets.ACCESS_TOKEN }}
+      - name: Manupolation in Helm Chart
+        run: |
+          tag=$(git rev-parse --short HEAD)
+          cd Helm-Charts-EKS-Deployment/image-api
+          sed -i "s|tag:.*|tag:\ prod-image-api-$tag|g" ./prod-values.yaml
+          git config --global user.email "armughanmb@outlook.com"
+          git config --global user.name "Armughan Bhutta"
+          git add .
+          git commit -m "docker image tag updated to prod-image-api-$tag"
+          git push origin main
+  Deploy-on-EKS:
+    needs: helm
+    runs-on: ubuntu-latest
+
+    steps:  
+      - name: Setting Kubernets Configuration
+        run: | 
+          pip install awscli kubernetes
+          aws --profile default configure set aws_access_key_id ${{ secrets.EKS_ACCESS_KEY }}
+          aws --profile default configure set aws_secret_access_key ${{ secrets.EKS_ACCESS_SECRET_ID }}
+          aws eks update-kubeconfig --name=99gens-eks --region=us-east-2
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      - name: Deploy on Kubernetes
+        uses: actions/checkout@v3
+      - uses: GuillaumeFalourd/clone-github-repo-action@v2
+        with:
+          owner: '99GensTeam'
+          repository: 'Helm-Charts-EKS-Deployment'
+          access-token: ${{ secrets.ACCESS_TOKEN }}
+      - name: Manipulation in Helm Chart
+        run: |
+          tag=$(git rev-parse --short HEAD)
+          cd Helm-Charts-EKS-Deployment/image-api/
+          export DEPLOY=$(helm  lint . -f prod-values.yaml | grep Error | wc -l)
+          echo "deploy value is ${DEPLOY}"
+          if [[ "${DEPLOY}" -eq 0 ]];
+          then
+            kubectl get nodes
+            helm upgrade --install prod-image-api . -f prod-values.yaml --create-namespace --namespace production \
+            --set image.tag=prod-image-api-$tag
+          else
+            echo "deployment failed" && exit 1
+          fi
+          kubectl rollout status deployment prod-image-api --namespace production;
